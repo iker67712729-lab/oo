@@ -1,0 +1,907 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover">
+<title>WebXR Physics Lab — Entrar a VR</title>
+<style>
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; height: 100%; overflow: hidden; font-family: -apple-system, 'Segoe UI', sans-serif; background: #05050a; color: #fff; }
+  #renderCanvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
+
+  /* Pantalla de inicio gigante */
+  #overlay {
+    position: fixed; inset: 0; z-index: 999;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    background: radial-gradient(circle at 50% 40%, #1a1a3a 0%, #05050a 80%);
+    text-align: center; padding: 24px;
+  }
+  #overlay h1 {
+    font-size: clamp(28px, 6vw, 64px); margin: 0 0 8px;
+    background: linear-gradient(90deg, #44aaff, #ffaa44);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+    font-weight: 800; letter-spacing: -1px;
+  }
+  #overlay p { color: #88aacc; font-size: clamp(14px, 2.5vw, 20px); margin: 0 0 32px; max-width: 600px; }
+  .btn {
+    display: inline-block; padding: 20px 48px; margin: 8px;
+    font-size: clamp(18px, 3vw, 28px); font-weight: 700;
+    border: none; border-radius: 999px; cursor: pointer;
+    transition: transform 0.15s ease, box-shadow 0.15s ease;
+    text-decoration: none; user-select: none;
+  }
+  .btn:active { transform: scale(0.96); }
+  #vrBtn {
+    background: linear-gradient(135deg, #44aaff, #2266cc);
+    color: #fff; box-shadow: 0 8px 32px rgba(68,170,255,0.5);
+    animation: pulse 2s infinite;
+  }
+  @keyframes pulse {
+    0%, 100% { box-shadow: 0 8px 32px rgba(68,170,255,0.5); }
+    50% { box-shadow: 0 8px 48px rgba(68,170,255,0.9); }
+  }
+  #flatBtn {
+    background: rgba(255,255,255,0.1); color: #fff;
+    border: 2px solid rgba(255,255,255,0.3); font-size: clamp(14px, 2vw, 18px);
+    padding: 14px 32px;
+  }
+  #status { margin-top: 24px; color: #ffaa44; font-size: 14px; min-height: 20px; }
+  .hint { color: #6688aa; font-size: 13px; margin-top: 16px; line-height: 1.6; }
+  .hint b { color: #44aaff; }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.126.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.126.0/examples/jsm/",
+    "cannon-es": "https://unpkg.com/cannon-es@0.20.0/dist/cannon-es.js"
+  }
+}
+</script>
+</head>
+<body>
+
+<div id="overlay">
+  <h1>WebXR Physics Lab</h1>
+  <p>Sandbox de física VR inspirado en BONELAB · Cajas, esferas, pistola, crowbar, orbe y muñecos</p>
+
+  <button id="vrBtn" class="btn">🥽 ENTRAR A VR</button>
+  <br>
+  <button id="flatBtn" class="btn">🖥️ Probar en pantalla (mouse)</button>
+
+  <div id="status"></div>
+
+  <div class="hint">
+    <b>Meta Quest:</b> Abre esta página en el Meta Quest Browser y pulsa ENTRAR A VR.<br>
+    <b>Controles:</b> Stick izq = mover · Stick der = girar 45° · Grip = agarrar · Trigger = disparar
+  </div>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { VRButton } from 'three/addons/webxr/VRButton.js';
+import * as CANNON from 'cannon-es';
+
+// ==================== DOM ====================
+const overlay   = document.getElementById('overlay');
+const vrBtn     = document.getElementById('vrBtn');
+const flatBtn   = document.getElementById('flatBtn');
+const statusEl  = document.getElementById('status');
+
+// ==================== RENDERER ====================
+const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.xr.enabled = true;
+renderer.domElement.id = 'renderCanvas';
+document.body.appendChild(renderer.domElement);
+
+// ==================== ESCENA ====================
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0a0a1a);
+scene.fog = new THREE.Fog(0x0a0a1a, 8, 28);
+
+const camera = new THREE.PerspectiveCamera(70, window.innerWidth/window.innerHeight, 0.1, 100);
+camera.position.set(0, 1.6, 3.5);
+
+// Rig para locomoción
+const cameraRig = new THREE.Group();
+cameraRig.add(camera);
+scene.add(cameraRig);
+
+// ==================== FÍSICA ====================
+const world = new CANNON.World();
+world.gravity.set(0, -9.82, 0);
+world.broadphase = new CANNON.SAPBroadphase(world);
+world.solver.iterations = 12;
+world.allowSleep = true;
+
+const matDefault = new CANNON.Material('default');
+const matGround  = new CANNON.Material('ground');
+world.addContactMaterial(new CANNON.ContactMaterial(matDefault, matGround, { friction: 0.5, restitution: 0.2 }));
+world.addContactMaterial(new CANNON.ContactMaterial(matDefault, matDefault, { friction: 0.4, restitution: 0.3 }));
+
+// ==================== LUCES ====================
+scene.add(new THREE.AmbientLight(0x606080, 1.2));
+scene.add(new THREE.HemisphereLight(0xaaccff, 0x222233, 1.0));
+
+const dirLight = new THREE.DirectionalLight(0xffffff, 1.5);
+dirLight.position.set(5, 10, 5);
+dirLight.castShadow = true;
+dirLight.shadow.mapSize.set(1024, 1024);
+Object.assign(dirLight.shadow.camera, { left:-10, right:10, top:10, bottom:-10, near:1, far:25 });
+scene.add(dirLight);
+
+const fill1 = new THREE.PointLight(0x4488ff, 0.8, 15); fill1.position.set(-6, 4, -5); scene.add(fill1);
+const fill2 = new THREE.PointLight(0xff8844, 0.6, 15); fill2.position.set(6, 4, 3);  scene.add(fill2);
+
+// ==================== TEXTURAS ====================
+function makeGridTexture(base, line, size = 512, div = 12) {
+  const c = document.createElement('canvas');
+  c.width = c.height = size;
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = base; ctx.fillRect(0, 0, size, size);
+  ctx.strokeStyle = line; ctx.lineWidth = 3;
+  const step = size / div;
+  for (let i = 0; i <= div; i++) {
+    ctx.beginPath(); ctx.moveTo(i*step, 0); ctx.lineTo(i*step, size); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(0, i*step); ctx.lineTo(size, i*step); ctx.stroke();
+  }
+  ctx.fillStyle = line;
+  for (let x = 0; x <= div; x++) for (let y = 0; y <= div; y++) {
+    if ((x+y)%2 === 0) { ctx.beginPath(); ctx.arc(x*step, y*step, 3, 0, Math.PI*2); ctx.fill(); }
+  }
+  const t = new THREE.CanvasTexture(c);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  return t;
+}
+const wallTex  = makeGridTexture('#3a3a4a', '#5a5a7a'); wallTex.repeat.set(4, 2);
+const floorTex = makeGridTexture('#222233', '#3a3a55'); floorTex.repeat.set(6, 6);
+
+// ==================== SUELO Y PAREDES ====================
+const floor = new THREE.Mesh(
+  new THREE.BoxGeometry(20, 0.2, 20),
+  new THREE.MeshStandardMaterial({ map: floorTex, roughness: 0.75, metalness: 0.25 })
+);
+floor.position.y = -0.1; floor.receiveShadow = true; scene.add(floor);
+
+const floorBody = new CANNON.Body({ mass: 0, material: matGround });
+floorBody.addShape(new CANNON.Box(new CANNON.Vec3(10, 0.1, 10)));
+floorBody.position.y = -0.1;
+world.addBody(floorBody);
+
+function addWall(w, h, d, x, y, z, rotY = 0) {
+  const mesh = new THREE.Mesh(
+    new THREE.BoxGeometry(w, h, d),
+    new THREE.MeshStandardMaterial({ map: wallTex, roughness: 0.8, metalness: 0.2 })
+  );
+  mesh.position.set(x, y, z); mesh.rotation.y = rotY;
+  mesh.castShadow = mesh.receiveShadow = true;
+  scene.add(mesh);
+  const body = new CANNON.Body({ mass: 0, material: matGround });
+  body.addShape(new CANNON.Box(new CANNON.Vec3(w/2, h/2, d/2)));
+  body.position.set(x, y, z);
+  body.quaternion.setFromEuler(0, rotY, 0);
+  world.addBody(body);
+}
+addWall(20, 5, 0.4, 0, 2.5, -9.8);
+addWall(20, 5, 0.4, -9.8, 2.5, 0, Math.PI/2);
+addWall(20, 5, 0.4, 9.8, 2.5, 0, -Math.PI/2);
+addWall(20, 5, 0.4, 0, 2.5, 9.8);
+
+const ceil = new THREE.Mesh(
+  new THREE.BoxGeometry(20, 0.2, 20),
+  new THREE.MeshStandardMaterial({ color: 0x1a1a2a, roughness: 0.9 })
+);
+ceil.position.y = 5; scene.add(ceil);
+
+// Lámparas de techo
+for (let i = -6; i <= 6; i += 4) for (let j = -6; j <= 6; j += 4) {
+  const lamp = new THREE.Mesh(
+    new THREE.BoxGeometry(0.6, 0.05, 0.6),
+    new THREE.MeshStandardMaterial({ color: 0xffffff, emissive: 0x88aaff, emissiveIntensity: 2 })
+  );
+  lamp.position.set(i, 4.9, j); scene.add(lamp);
+}
+
+// ==================== RAMPA Y MESA ====================
+const ramp = new THREE.Mesh(
+  new THREE.BoxGeometry(3, 0.25, 5),
+  new THREE.MeshStandardMaterial({ color: 0x8a7f6e, roughness: 0.6, metalness: 0.3 })
+);
+ramp.position.set(3, 0.7, 2); ramp.rotation.set(0.1, 0, 0.35);
+ramp.castShadow = ramp.receiveShadow = true; scene.add(ramp);
+
+const rampBody = new CANNON.Body({ mass: 0, material: matGround });
+rampBody.addShape(new CANNON.Box(new CANNON.Vec3(1.5, 0.125, 2.5)));
+rampBody.position.set(3, 0.7, 2);
+rampBody.quaternion.setFromEuler(0.1, 0, 0.35);
+world.addBody(rampBody);
+
+const tableTop = new THREE.Mesh(
+  new THREE.BoxGeometry(2.8, 0.15, 1.3),
+  new THREE.MeshStandardMaterial({ color: 0x5a4a3a, roughness: 0.5, metalness: 0.3 })
+);
+tableTop.position.set(0, 1.2, -1.5);
+tableTop.castShadow = tableTop.receiveShadow = true; scene.add(tableTop);
+
+const legMat = new THREE.MeshStandardMaterial({ color: 0x333333, metalness: 0.8, roughness: 0.3 });
+const legGeo = new THREE.CylinderGeometry(0.07, 0.07, 1.15, 8);
+for (let i = 0; i < 4; i++) {
+  const leg = new THREE.Mesh(legGeo, legMat);
+  leg.position.set((i%2===0?1:-1)*1.1, 0.575, (i<2?0.4:-0.4)-1.5);
+  leg.castShadow = true; scene.add(leg);
+}
+
+const tableBody = new CANNON.Body({ mass: 0, material: matGround });
+tableBody.addShape(new CANNON.Box(new CANNON.Vec3(1.4, 0.075, 0.65)));
+tableBody.position.set(0, 1.2, -1.5);
+world.addBody(tableBody);
+
+// ==================== PROPS ====================
+const props = [];
+const syncMesh = (m, b) => { m.position.copy(b.position); m.quaternion.copy(b.quaternion); };
+
+function createCrate(pos, size = 0.5, mass = 3, color = 0xb58a5c) {
+  const mesh = new THREE.Mesh(
+    new THREE.BoxGeometry(size, size, size),
+    new THREE.MeshStandardMaterial({ color, roughness: 0.7, metalness: 0.1 })
+  );
+  mesh.castShadow = mesh.receiveShadow = true; mesh.position.copy(pos); scene.add(mesh);
+  const body = new CANNON.Body({ mass, material: matDefault });
+  body.addShape(new CANNON.Box(new CANNON.Vec3(size/2, size/2, size/2)));
+  body.position.copy(pos);
+  body.linearDamping = 0.15; body.angularDamping = 0.2;
+  world.addBody(body);
+  props.push({ mesh, body, type: 'crate', grabbable: true });
+}
+
+for (let i = 0; i < 3; i++) for (let j = 0; j < 2; j++)
+  createCrate(new THREE.Vector3(-3 + j*0.55, 0.25 + i*0.55, -4), 0.5, 3);
+createCrate(new THREE.Vector3(4, 0.3, -3), 0.6, 5, 0x8a6e4b);
+createCrate(new THREE.Vector3(4.3, 0.95, -3.2), 0.5, 3, 0x9a7e5b);
+createCrate(new THREE.Vector3(-2, 0.3, 4), 0.7, 6, 0x7a5e3b);
+
+function createSphere(pos, r = 0.25, mass = 10, color = 0xcc3333) {
+  const mesh = new THREE.Mesh(
+    new THREE.SphereGeometry(r, 16, 16),
+    new THREE.MeshStandardMaterial({ color, roughness: 0.3, metalness: 0.7 })
+  );
+  mesh.castShadow = mesh.receiveShadow = true; mesh.position.copy(pos); scene.add(mesh);
+  const body = new CANNON.Body({ mass, material: matDefault });
+  body.addShape(new CANNON.Sphere(r));
+  body.position.copy(pos);
+  body.linearDamping = 0.1; body.angularDamping = 0.3;
+  world.addBody(body);
+  props.push({ mesh, body, type: 'sphere', grabbable: true });
+}
+createSphere(new THREE.Vector3(-1.5, 0.5, 3), 0.3, 12, 0xdd4444);
+createSphere(new THREE.Vector3(1.8, 0.8, -3.5), 0.35, 15, 0x44aaff);
+createSphere(new THREE.Vector3(-4, 0.6, -1), 0.4, 18, 0xffaa44);
+
+// Crowbar
+(function() {
+  const group = new THREE.Group();
+  const handle = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.04, 0.04, 0.6, 6),
+    new THREE.MeshStandardMaterial({ color: 0x884422, roughness: 0.8 })
+  );
+  handle.position.y = 0.3; handle.castShadow = true; group.add(handle);
+  const head = new THREE.Mesh(
+    new THREE.BoxGeometry(0.09, 0.18, 0.09),
+    new THREE.MeshStandardMaterial({ color: 0xbbbbbb, roughness: 0.2, metalness: 0.95 })
+  );
+  head.position.y = 0.72; head.castShadow = true; group.add(head);
+  group.position.set(-0.7, 1.35, -1.5);
+  scene.add(group);
+
+  const body = new CANNON.Body({ mass: 3, material: matDefault });
+  body.addShape(new CANNON.Box(new CANNON.Vec3(0.08, 0.4, 0.08)));
+  body.position.set(-0.7, 1.75, -1.5);
+  body.linearDamping = 0.3; body.angularDamping = 0.5;
+  world.addBody(body);
+  props.push({ mesh: group, body, type: 'crowbar', grabbable: true, special: 'melee' });
+})();
+
+// Pistol
+(function() {
+  const group = new THREE.Group();
+  const bodyMesh = new THREE.Mesh(
+    new THREE.BoxGeometry(0.13, 0.15, 0.32),
+    new THREE.MeshStandardMaterial({ color: 0x2a2a3a, roughness: 0.3, metalness: 0.85 })
+  );
+  bodyMesh.position.z = -0.1; bodyMesh.castShadow = true; group.add(bodyMesh);
+  const barrel = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.045, 0.045, 0.45, 8),
+    new THREE.MeshStandardMaterial({ color: 0x888888, metalness: 0.95, roughness: 0.15 })
+  );
+  barrel.rotation.x = Math.PI/2; barrel.position.set(0, 0.02, -0.4); group.add(barrel);
+  const grip = new THREE.Mesh(
+    new THREE.BoxGeometry(0.1, 0.22, 0.12),
+    new THREE.MeshStandardMaterial({ color: 0x111111, roughness: 0.8 })
+  );
+  grip.position.set(0, -0.14, -0.05); group.add(grip);
+  const tip = new THREE.Mesh(
+    new THREE.SphereGeometry(0.035, 8, 8),
+    new THREE.MeshStandardMaterial({ color: 0xffaa00, emissive: 0xff5500, emissiveIntensity: 2 })
+  );
+  tip.position.set(0, 0.02, -0.62); group.add(tip);
+  group.position.set(0, 1.35, -1.5); scene.add(group);
+
+  const body = new CANNON.Body({ mass: 1.5, material: matDefault });
+  body.addShape(new CANNON.Box(new CANNON.Vec3(0.1, 0.1, 0.22)));
+  body.position.set(0, 1.35, -1.5);
+  body.linearDamping = 0.4; body.angularDamping = 0.6;
+  world.addBody(body);
+  props.push({ mesh: group, body, type: 'pistol', grabbable: true, special: 'gun', lastFire: 0 });
+})();
+
+// Orbe antigravedad
+(function() {
+  const mesh = new THREE.Mesh(
+    new THREE.SphereGeometry(0.2, 20, 20),
+    new THREE.MeshStandardMaterial({
+      color: 0x44aaff, emissive: 0x2266cc, emissiveIntensity: 1.5,
+      transparent: true, opacity: 0.85
+    })
+  );
+  mesh.position.set(0.7, 1.35, -1.5); mesh.castShadow = true; scene.add(mesh);
+  const ring = new THREE.Mesh(
+    new THREE.TorusGeometry(0.28, 0.015, 8, 24),
+    new THREE.MeshStandardMaterial({ color: 0x88ccff, emissive: 0x4488ff, emissiveIntensity: 2 })
+  );
+  ring.rotation.x = Math.PI/2; mesh.add(ring);
+  const body = new CANNON.Body({ mass: 0.8, material: matDefault });
+  body.addShape(new CANNON.Sphere(0.2));
+  body.position.set(0.7, 1.35, -1.5);
+  body.linearDamping = 0.92; body.angularDamping = 0.9;
+  world.addBody(body);
+  props.push({ mesh, body, type: 'orb', grabbable: true, special: 'lowgrav' });
+})();
+
+// ==================== MUÑECOS ====================
+const dummyGroups = [];
+function createDummy(basePos, platH = 0.6) {
+  const parts = [], meshes = [];
+
+  const plat = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.8, 0.85, 0.2, 10),
+    new THREE.MeshStandardMaterial({ color: 0x555566, roughness: 0.7, metalness: 0.3 })
+  );
+  plat.position.set(basePos.x, platH - 0.1, basePos.z);
+  plat.receiveShadow = true; scene.add(plat);
+  const platBody = new CANNON.Body({ mass: 0, material: matGround });
+  platBody.addShape(new CANNON.Cylinder(0.8, 0.85, 0.2, 10));
+  platBody.position.set(basePos.x, platH - 0.1, basePos.z);
+  world.addBody(platBody);
+
+  function addPart(shape, pos, mass, color) {
+    const mesh = new THREE.Mesh(shape, new THREE.MeshStandardMaterial({ color, roughness: 0.5, metalness: 0.2 }));
+    mesh.castShadow = mesh.receiveShadow = true; mesh.position.copy(pos); scene.add(mesh);
+    const body = new CANNON.Body({ mass, material: matDefault });
+    if (shape.type === 'SphereGeometry') body.addShape(new CANNON.Sphere(shape.parameters.radius));
+    else if (shape.type === 'CylinderGeometry') body.addShape(new CANNON.Cylinder(shape.parameters.radiusTop, shape.parameters.radiusBottom, shape.parameters.height, 8));
+    else body.addShape(new CANNON.Box(new CANNON.Vec3(shape.parameters.width/2, shape.parameters.height/2, shape.parameters.depth/2)));
+    body.position.copy(pos);
+    body.linearDamping = 0.4; body.angularDamping = 0.4;
+    world.addBody(body);
+    parts.push(body); meshes.push(mesh);
+    return body;
+  }
+
+  addPart(new THREE.CylinderGeometry(0.25, 0.25, 0.6, 8), new THREE.Vector3(basePos.x, platH + 0.3, basePos.z), 8, 0xdd8844);
+  addPart(new THREE.SphereGeometry(0.2, 12, 12), new THREE.Vector3(basePos.x, platH + 0.78, basePos.z), 4, 0xffaa66);
+  const lArm = addPart(new THREE.CylinderGeometry(0.08, 0.08, 0.5, 6), new THREE.Vector3(basePos.x - 0.38, platH + 0.4, basePos.z), 2, 0xcc8844);
+  lArm.quaternion.setFromEuler(0, 0, 0.6);
+  const rArm = addPart(new THREE.CylinderGeometry(0.08, 0.08, 0.5, 6), new THREE.Vector3(basePos.x + 0.38, platH + 0.4, basePos.z), 2, 0xcc8844);
+  rArm.quaternion.setFromEuler(0, 0, -0.6);
+  addPart(new THREE.CylinderGeometry(0.09, 0.09, 0.5, 6), new THREE.Vector3(basePos.x - 0.15, platH - 0.05, basePos.z), 2.5, 0xbb7733);
+  addPart(new THREE.CylinderGeometry(0.09, 0.09, 0.5, 6), new THREE.Vector3(basePos.x + 0.15, platH - 0.05, basePos.z), 2.5, 0xbb7733);
+
+  dummyGroups.push({ parts, meshes });
+}
+createDummy(new THREE.Vector3(-2.5, 0, -6), 0.6);
+createDummy(new THREE.Vector3(3.0, 0, -5), 0.6);
+
+// ==================== CONTROLADORES VR ====================
+const controllers = [];
+
+function createHandMesh(isLeft) {
+  const g = new THREE.Group();
+  const col = isLeft ? 0x44aaff : 0xffaa44;
+  const palm = new THREE.Mesh(
+    new THREE.BoxGeometry(0.1, 0.08, 0.12),
+    new THREE.MeshStandardMaterial({ color: col, roughness: 0.3, metalness: 0.8 })
+  );
+  palm.castShadow = true; g.add(palm);
+  const fingerMat = new THREE.MeshStandardMaterial({ color: col, roughness: 0.4, metalness: 0.6 });
+  for (let i = 0; i < 3; i++) {
+    const f = new THREE.Mesh(new THREE.CylinderGeometry(0.02, 0.018, 0.1, 5), fingerMat);
+    f.position.set((i-1)*0.04, 0.05, -0.07); f.rotation.x = 0.3; f.castShadow = true; g.add(f);
+  }
+  const t = new THREE.Mesh(new THREE.CylinderGeometry(0.02, 0.018, 0.08, 5), fingerMat);
+  t.position.set(-0.07, 0.02, -0.02); t.rotation.set(0.5, 0, 0.6); t.castShadow = true; g.add(t);
+  const tip = new THREE.Mesh(
+    new THREE.SphereGeometry(0.025, 8, 8),
+    new THREE.MeshStandardMaterial({ color: col, emissive: col, emissiveIntensity: 1.5 })
+  );
+  tip.position.set(0, 0, -0.06); g.add(tip);
+  return g;
+}
+
+for (let i = 0; i < 2; i++) {
+  const c = renderer.xr.getController(i);
+  c.userData.heldObject = null;
+  c.userData.heldOffset = new THREE.Vector3();
+  c.userData.heldQuatOffset = new THREE.Quaternion();
+  c.userData.prevPos = new THREE.Vector3();
+  c.userData.prevQuat = new THREE.Quaternion();
+  scene.add(c);
+
+  const hand = createHandMesh(i === 0);
+  hand.visible = false;
+  c.add(hand);
+  c.userData.handMesh = hand;
+
+  const hb = new CANNON.Body({ mass: 0, type: CANNON.Body.KINEMATIC, material: matDefault });
+  hb.addShape(new CANNON.Sphere(0.12));
+  hb.position.set(0, 1, 0);
+  world.addBody(hb);
+  c.userData.handBody = hb;
+
+  c.addEventListener('selectstart', () => onTriggerDown(c));
+  c.addEventListener('selectend',   () => onTriggerUp(c));
+  c.addEventListener('squeezestart', () => onGripDown(c));
+  c.addEventListener('squeezeend',   () => onGripUp(c));
+  controllers.push(c);
+}
+
+renderer.xr.addEventListener('sessionstart', () => {
+  controllers.forEach(c => c.userData.handMesh.visible = true);
+  if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+  cameraRig.position.set(0, 0, 0);
+  cameraRig.rotation.set(0, 0, 0);
+});
+
+// ==================== AGARRE ====================
+const GRAB_DIST = 0.45;
+
+function onGripDown(c) {
+  if (c.userData.heldObject) return;
+  const cPos = new THREE.Vector3(), cQuat = new THREE.Quaternion();
+  c.getWorldPosition(cPos); c.getWorldQuaternion(cQuat);
+
+  let nearest = null, minD = GRAB_DIST;
+  props.forEach(p => {
+    if (!p.grabbable || p.body.mass === 0) return;
+    const d = p.mesh.position.distanceTo(cPos);
+    if (d < minD) { minD = d; nearest = p; }
+  });
+
+  if (nearest) {
+    c.userData.heldObject = nearest;
+    const localPos = nearest.mesh.position.clone().sub(cPos);
+    localPos.applyQuaternion(cQuat.clone().invert());
+    c.userData.heldOffset.copy(localPos);
+    c.userData.heldQuatOffset.copy(cQuat.clone().invert().multiply(nearest.mesh.quaternion));
+
+    nearest.body.type = CANNON.Body.KINEMATIC;
+    nearest.body.mass = 0;
+    nearest.body.updateMassProperties();
+    nearest.body.velocity.setZero();
+    nearest.body.angularVelocity.setZero();
+    playSound('grab');
+  }
+}
+
+function onGripUp(c) {
+  const held = c.userData.heldObject;
+  if (!held) return;
+
+  held.body.type = CANNON.Body.DYNAMIC;
+  const masses = { crate: 3, sphere: 10, crowbar: 3, pistol: 1.5, orb: 0.8 };
+  held.body.mass = masses[held.type] || 2;
+  held.body.updateMassProperties();
+
+  const cPos = new THREE.Vector3(), cQuat = new THREE.Quaternion();
+  c.getWorldPosition(cPos); c.getWorldQuaternion(cQuat);
+
+  const vel = cPos.clone().sub(c.userData.prevPos).multiplyScalar(60);
+  held.body.velocity.copy(vel);
+
+  const dir = new THREE.Vector3(0, 0, -1).applyQuaternion(cQuat);
+  held.body.velocity.add(dir.multiplyScalar(1.5));
+
+  const qD = cQuat.clone().multiply(c.userData.prevQuat.clone().invert());
+  const e = new THREE.Euler().setFromQuaternion(qD);
+  held.body.angularVelocity.set(e.x*20, e.y*20, e.z*20);
+
+  c.userData.heldObject = null;
+  playSound('release');
+}
+
+// ==================== DISPARO ====================
+function onTriggerDown(c) {
+  const h = c.userData.heldObject;
+  if (h && h.type === 'pistol') firePistol(c, h);
+}
+function onTriggerUp() {}
+
+function firePistol(c, pistol) {
+  const now = performance.now();
+  if (now - pistol.lastFire < 250) return;
+  pistol.lastFire = now;
+
+  const muzzle = new THREE.Vector3(0, 0.02, -0.62);
+  pistol.mesh.localToWorld(muzzle);
+  const dir = new THREE.Vector3(0, 0, -1).applyQuaternion(pistol.mesh.quaternion).normalize();
+
+  const bMesh = new THREE.Mesh(
+    new THREE.SphereGeometry(0.05, 6, 6),
+    new THREE.MeshStandardMaterial({ color: 0xffaa00, emissive: 0xff4400, emissiveIntensity: 2 })
+  );
+  bMesh.position.copy(muzzle); scene.add(bMesh);
+
+  const bBody = new CANNON.Body({ mass: 0.4, material: matDefault });
+  bBody.addShape(new CANNON.Sphere(0.05));
+  bBody.position.copy(muzzle);
+  bBody.velocity.copy(dir.multiplyScalar(40));
+  bBody.linearDamping = 0.01;
+  world.addBody(bBody);
+
+  props.push({ mesh: bMesh, body: bBody, type: 'bullet', ttl: 4.0 });
+
+  pistol.body.velocity.add(dir.clone().negate().multiplyScalar(2));
+  pistol.body.angularVelocity.x += (Math.random()-0.5)*3;
+
+  playSound('gunshot');
+  const flash = new THREE.PointLight(0xffaa00, 3, 3);
+  flash.position.copy(muzzle); scene.add(flash);
+  setTimeout(() => scene.remove(flash), 60);
+}
+
+// ==================== COLISIONES ====================
+world.addEventListener('postStep', () => {
+  for (let i = props.length - 1; i >= 0; i--) {
+    const p = props[i];
+    if (p.type === 'bullet') {
+      p.ttl -= 1/60;
+      let hit = false;
+      dummyGroups.forEach(d => d.parts.forEach(part => {
+        if (p.body.position.distanceTo(part.position) < 0.45) {
+          const dmg = p.body.velocity.length() * 0.8;
+          d.parts.forEach(pp => {
+            const imp = new CANNON.Vec3(
+              (pp.position.x - p.body.position.x) * dmg,
+              (pp.position.y - p.body.position.y) * dmg + 2,
+              (pp.position.z - p.body.position.z) * dmg
+            );
+            pp.applyImpulse(imp, pp.position);
+            pp.wakeUp();
+          });
+          hit = true;
+          playSound('hit');
+        }
+      }));
+      if (hit || p.ttl <= 0) {
+        scene.remove(p.mesh); world.removeBody(p.body); props.splice(i, 1);
+      }
+    }
+  }
+
+  props.forEach(p => {
+    if (p.type === 'crowbar') {
+      const sp = p.body.velocity.length();
+      if (sp > 2.5) dummyGroups.forEach(d => d.parts.forEach(part => {
+        if (p.body.position.distanceTo(part.position) < 0.7) {
+          const dir = new CANNON.Vec3(p.body.velocity.x, p.body.velocity.y + 3, p.body.velocity.z);
+          dir.normalize(); dir.scale(sp*2, dir);
+          part.applyImpulse(dir, part.position);
+          part.wakeUp();
+          playSound('hit');
+        }
+      }));
+    }
+  });
+});
+
+// ==================== AUDIO ====================
+let audioCtx = null;
+function initAudio() {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+}
+function playSound(type) {
+  if (!audioCtx) return;
+  const t = audioCtx.currentTime;
+  if (type === 'grab') {
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.type='sine'; o.frequency.setValueAtTime(600,t);
+    o.frequency.exponentialRampToValueAtTime(900,t+0.08);
+    g.gain.setValueAtTime(0.15,t);
+    g.gain.exponentialRampToValueAtTime(0.01,t+0.12);
+    o.connect(g).connect(audioCtx.destination); o.start(t); o.stop(t+0.12);
+  } else if (type === 'release') {
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.type='sine'; o.frequency.setValueAtTime(400,t);
+    o.frequency.exponentialRampToValueAtTime(200,t+0.1);
+    g.gain.setValueAtTime(0.12,t);
+    g.gain.exponentialRampToValueAtTime(0.01,t+0.1);
+    o.connect(g).connect(audioCtx.destination); o.start(t); o.stop(t+0.1);
+  } else if (type === 'gunshot') {
+    const n = audioCtx.sampleRate * 0.15;
+    const buf = audioCtx.createBuffer(1, n, audioCtx.sampleRate);
+    const d = buf.getChannelData(0);
+    for (let i = 0; i < n; i++) d[i] = (Math.random()*2-1)*Math.exp(-i/(n*0.15));
+    const src = audioCtx.createBufferSource(); src.buffer = buf;
+    const g = audioCtx.createGain(); g.gain.setValueAtTime(0.6,t);
+    g.gain.exponentialRampToValueAtTime(0.01,t+0.15);
+    src.connect(g).connect(audioCtx.destination); src.start(t);
+    const o = audioCtx.createOscillator(), g2 = audioCtx.createGain();
+    o.type='square'; o.frequency.setValueAtTime(120,t);
+    o.frequency.exponentialRampToValueAtTime(40,t+0.15);
+    g2.gain.setValueAtTime(0.3,t);
+    g2.gain.exponentialRampToValueAtTime(0.01,t+0.2);
+    o.connect(g2).connect(audioCtx.destination); o.start(t); o.stop(t+0.2);
+  } else if (type === 'hit') {
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.type='triangle'; o.frequency.setValueAtTime(180,t);
+    o.frequency.exponentialRampToValueAtTime(60,t+0.1);
+    g.gain.setValueAtTime(0.4,t);
+    g.gain.exponentialRampToValueAtTime(0.01,t+0.12);
+    o.connect(g).connect(audioCtx.destination); o.start(t); o.stop(t+0.12);
+  }
+}
+
+// ==================== LOCOMOCIÓN ====================
+let leftStick = { x:0, y:0 }, rightStick = { x:0, y:0 }, snapCD = 0;
+function readSticks() {
+  controllers.forEach((c, i) => {
+    if (!c.inputSource || !c.inputSource.gamepad) return;
+    const gp = c.inputSource.gamepad;
+    if (gp.axes.length >= 4) {
+      const x = gp.axes[2] || 0, y = gp.axes[3] || 0;
+      if (i === 0) { leftStick.x = x; leftStick.y = y; }
+      else         { rightStick.x = x; rightStick.y = y; }
+    }
+  });
+}
+
+// ==================== MODO PANTALLA PLANA (mouse) ====================
+let flatMode = false;
+let flatKeys = {};
+let flatYaw = 0, flatPitch = 0;
+let flatMouseDown = false;
+let flatHeld = null;
+
+function enableFlatMode() {
+  flatMode = true;
+  overlay.style.display = 'none';
+
+  // Inicializar cámara plana
+  camera.position.set(0, 1.6, 3.5);
+  cameraRig.position.set(0, 0, 0);
+  cameraRig.rotation.set(0, 0, 0);
+
+  document.addEventListener('keydown', e => { flatKeys[e.code] = true; });
+  document.addEventListener('keyup',   e => { flatKeys[e.code] = false; });
+
+  renderer.domElement.addEventListener('mousedown', e => {
+    if (e.button === 0) {
+      flatMouseDown = true;
+      // Agarrar objeto más cercano a la cámara
+      const camPos = new THREE.Vector3();
+      camera.getWorldPosition(camPos);
+      let near = null, minD = 2.5;
+      props.forEach(p => {
+        if (!p.grabbable || p.body.mass === 0) return;
+        const d = p.mesh.position.distanceTo(camPos);
+        if (d < minD) { minD = d; near = p; }
+      });
+      if (near) {
+        flatHeld = near;
+        near.body.type = CANNON.Body.KINEMATIC;
+        near.body.mass = 0;
+        near.body.updateMassProperties();
+        near.body.velocity.setZero();
+        near.body.angularVelocity.setZero();
+        playSound('grab');
+      }
+    }
+  });
+
+  renderer.domElement.addEventListener('mouseup', e => {
+    if (e.button === 0 && flatHeld) {
+      flatHeld.body.type = CANNON.Body.DYNAMIC;
+      const masses = { crate:3, sphere:10, crowbar:3, pistol:1.5, orb:0.8 };
+      flatHeld.body.mass = masses[flatHeld.type] || 2;
+      flatHeld.body.updateMassProperties();
+      const dir = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
+      flatHeld.body.velocity.copy(dir.multiplyScalar(8));
+      flatHeld.body.angularVelocity.set((Math.random()-0.5)*5, (Math.random()-0.5)*5, (Math.random()-0.5)*5);
+      flatHeld = null;
+      playSound('release');
+    }
+    flatMouseDown = false;
+  });
+
+  renderer.domElement.addEventListener('mousemove', e => {
+    if (flatMouseDown) {
+      flatYaw   -= e.movementX * 0.002;
+      flatPitch -= e.movementY * 0.002;
+      flatPitch = Math.max(-Math.PI/2 + 0.1, Math.min(Math.PI/2 - 0.1, flatPitch));
+      camera.rotation.order = 'YXZ';
+      camera.rotation.y = flatYaw;
+      camera.rotation.x = flatPitch;
+    }
+  });
+
+  // Click derecho para disparar
+  renderer.domElement.addEventListener('contextmenu', e => {
+    e.preventDefault();
+    const pistol = props.find(p => p.type === 'pistol');
+    if (pistol) firePistolFromCamera(pistol);
+  });
+
+  statusEl.textContent = 'Modo pantalla: WASD mover · Click izq agarrar · Click der disparar';
+}
+
+function firePistolFromCamera(pistol) {
+  const muzzle = new THREE.Vector3();
+  pistol.mesh.getWorldPosition(muzzle);
+  const dir = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion).normalize();
+
+  const bMesh = new THREE.Mesh(
+    new THREE.SphereGeometry(0.05, 6, 6),
+    new THREE.MeshStandardMaterial({ color: 0xffaa00, emissive: 0xff4400, emissiveIntensity: 2 })
+  );
+  bMesh.position.copy(muzzle); scene.add(bMesh);
+
+  const bBody = new CANNON.Body({ mass: 0.4, material: matDefault });
+  bBody.addShape(new CANNON.Sphere(0.05));
+  bBody.position.copy(muzzle);
+  bBody.velocity.copy(dir.multiplyScalar(40));
+  world.addBody(bBody);
+  props.push({ mesh: bMesh, body: bBody, type: 'bullet', ttl: 4.0 });
+  playSound('gunshot');
+}
+
+// ==================== BOTONES DE LA PANTALLA ====================
+async function enterVR() {
+  initAudio();
+  statusEl.textContent = 'Solicitando sesión XR…';
+
+  if (!navigator.xr) {
+    statusEl.textContent = '❌ WebXR no disponible en este navegador. Usa el Meta Quest Browser.';
+    return;
+  }
+  try {
+    const supported = await navigator.xr.isSessionSupported('immersive-vr');
+    if (!supported) {
+      statusEl.textContent = '❌ Este dispositivo no soporta VR inmersivo. Prueba "Modo pantalla".';
+      return;
+    }
+    const session = await navigator.xr.requestSession('immersive-vr', {
+      optionalFeatures: ['local-floor', 'bounded-floor', 'hand-tracking']
+    });
+    renderer.xr.setSession(session);
+    overlay.style.display = 'none';
+    statusEl.textContent = '';
+  } catch (err) {
+    console.error(err);
+    statusEl.textContent = '❌ Error al iniciar VR: ' + err.message;
+  }
+}
+
+vrBtn.addEventListener('click', enterVR);
+flatBtn.addEventListener('click', () => { initAudio(); enableFlatMode(); });
+
+// Soporte para gamepad en modo plano (opcional)
+window.addEventListener('gamepadconnected', () => {});
+
+// ==================== BUCLE PRINCIPAL ====================
+const clock = new THREE.Clock();
+
+renderer.setAnimationLoop(() => {
+  const dt = Math.min(clock.getDelta(), 0.1);
+
+  if (!flatMode) {
+    readSticks();
+
+    // Mover con stick izquierdo
+    if (Math.abs(leftStick.x) > 0.15 || Math.abs(leftStick.y) > 0.15) {
+      const speed = 2.2 * dt;
+      const camDir = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
+      camDir.y = 0; camDir.normalize();
+      const rightDir = new THREE.Vector3(1, 0, 0).applyQuaternion(camera.quaternion);
+      rightDir.y = 0; rightDir.normalize();
+      const move = new THREE.Vector3();
+      move.addScaledVector(camDir, -leftStick.y * speed);
+      move.addScaledVector(rightDir, leftStick.x * speed);
+      cameraRig.position.add(move);
+    }
+
+    // Snap turn con stick derecho
+    if (snapCD > 0) snapCD -= dt;
+    if (Math.abs(rightStick.x) > 0.7 && snapCD <= 0) {
+      const angle = Math.PI / 4;
+      const dir = rightStick.x > 0 ? -1 : 1;
+      cameraRig.rotation.y += dir * angle;
+      snapCD = 0.25;
+    }
+
+    // Actualizar manos VR
+    controllers.forEach(c => {
+      const hb = c.userData.handBody;
+      if (hb) {
+        const p = new THREE.Vector3(), q = new THREE.Quaternion();
+        c.getWorldPosition(p); c.getWorldQuaternion(q);
+        hb.position.copy(p); hb.quaternion.copy(q);
+      }
+      const held = c.userData.heldObject;
+      if (held) {
+        const p = new THREE.Vector3(), q = new THREE.Quaternion();
+        c.getWorldPosition(p); c.getWorldQuaternion(q);
+        const off = c.userData.heldOffset.clone().applyQuaternion(q);
+        held.body.position.copy(p).add(off);
+        held.body.quaternion.copy(q).multiply(c.userData.heldQuatOffset);
+        held.body.velocity.setZero();
+        held.body.angularVelocity.setZero();
+      }
+      const pp = new THREE.Vector3(), pq = new THREE.Quaternion();
+      c.getWorldPosition(pp); c.getWorldQuaternion(pq);
+      c.userData.prevPos.copy(pp);
+      c.userData.prevQuat.copy(pq);
+    });
+  } else {
+    // ---- Modo pantalla plana ----
+    if (flatHeld) {
+      const camPos = new THREE.Vector3();
+      camera.getWorldPosition(camPos);
+      const dir = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
+      const target = camPos.clone().add(dir.multiplyScalar(1.2));
+      flatHeld.body.position.copy(target);
+      flatHeld.body.velocity.setZero();
+      flatHeld.body.angularVelocity.setZero();
+    }
+
+    const speed = 3.0 * dt;
+    const fwd = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
+    fwd.y = 0; fwd.normalize();
+    const right = new THREE.Vector3(1, 0, 0).applyQuaternion(camera.quaternion);
+    right.y = 0; right.normalize();
+    const mv = new THREE.Vector3();
+    if (flatKeys['KeyW'] || flatKeys['ArrowUp'])    mv.add(fwd);
+    if (flatKeys['KeyS'] || flatKeys['ArrowDown'])  mv.sub(fwd);
+    if (flatKeys['KeyA'] || flatKeys['ArrowLeft'])  mv.sub(right);
+    if (flatKeys['KeyD'] || flatKeys['ArrowRight']) mv.add(right);
+    if (mv.length() > 0) { mv.normalize(); camera.position.add(mv.multiplyScalar(speed)); }
+  }
+
+  // Física
+  world.step(1/60, dt, 3);
+
+  // Sincronizar
+  props.forEach(p => { if (p.mesh && p.body) syncMesh(p.mesh, p.body); });
+  dummyGroups.forEach(d => d.parts.forEach((part, i) => {
+    if (d.meshes[i]) {
+      d.meshes[i].position.copy(part.position);
+      d.meshes[i].quaternion.copy(part.quaternion);
+    }
+  }));
+
+  renderer.render(scene, camera);
+});
+
+// ==================== RESIZE ====================
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+console.log('🧪 WebXR Physics Lab — listo. Pulsa ENTRAR A VR o Modo pantalla.');
+</script>
+</body>
+</html>
